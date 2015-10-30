@@ -1,5 +1,7 @@
 LAVA: Lightweight Assignment of Variant Alleles
-===============================================
+-----------------------------------------------
+
+LAVA is an NGS-based computational SNP array. LAVA is able to call with high accuracy the vast majority of SNPs in dbSNP and Affymetrix’s Genome-Wide Human SNP Array 6.0, while performing 4-7 times faster than a standard NGS genotyping pipeline. As such, it is a flexible and scalable replacement for SNP arrays, for which the set of variants assayed both can be modified in silico without having to redesign an array and is not bounded in number by the physical limits of a chip.
 
 ### Usage
 
@@ -7,7 +9,7 @@ LAVA: Lightweight Assignment of Variant Alleles
 
     lava dict <input FASTA> <input SNP list> <output ref dict> <output SNP dict>
 
-The SNP list should be in [UCSC's txt-based format][1].
+The inputted FASTA file is the reference sequence. The inputted SNP list should be in [UCSC's txt-based format][1].
 
 ##### Processing
 
