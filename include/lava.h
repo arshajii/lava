@@ -4,9 +4,15 @@
 #include <stdint.h>
 
 /////////////////////////////
-#define DEBUG     0        //
-#define ERR_RATE  0.10     //
-#define AVG_COV   7.1      //
+#define DEBUG        0
+#define REF_LITE     0
+#define PCOMPACT     0
+#define GEN_FLT_DATA 0
+
+#define READ_LEN       101
+#define ERR_RATE       0.01
+#define AVG_COV        7.1
+#define MAX_MATES_DIST 2000
 /////////////////////////////
 
 #define BASE_A 0x0
@@ -54,7 +60,11 @@ struct snp_kmer_info {
 } __attribute__((packed));
 
 struct kmer_entry {
+#if REF_LITE
+	uint64_t kmer_lo40 : 40;
+#else
 	uint32_t kmer_lo;
+#endif
 	uint32_t pos;
 	uint8_t ambig_flag;
 } __attribute__((packed));
@@ -66,6 +76,7 @@ struct snp_kmer_entry {
 	uint8_t ambig_flag;
 } __attribute__((packed));
 
+#if !PCOMPACT
 struct pileup_entry {
 	unsigned ref : 2;
 	unsigned alt : 2;
@@ -74,6 +85,7 @@ struct pileup_entry {
 	uint8_t ref_freq;
 	uint8_t alt_freq;
 } __attribute__((packed));
+#endif
 
 /* table for storing multiple positions in case of ambiguous k-mers */
 #define AUX_TABLE_COLS 10

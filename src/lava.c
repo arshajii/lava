@@ -9,8 +9,13 @@
 #include <assert.h>
 #include "fasta_parser.h"
 #include "dictgen.h"
+#include "dict_filt.h"
 #include "util.h"
 #include "lava.h"
+
+#if PCOMPACT
+  #include "pileup.h"
+#endif
 
 /*
  * We use the following structures for quickly finding the index that
@@ -95,6 +100,8 @@ void index_table_add(IndexTable *index_table, uint32_t index)
 
 /* --- */
 
+#define PILEUP_TABLE_INIT_SIZE (1 << 25)
+
 static struct kmer_entry *query_ref_dict(kmer_t key,
                                          uint32_t *ref_jumpgate,
                                          struct kmer_entry *ref_dict,
@@ -107,8 +114,13 @@ static struct snp_kmer_entry *query_snp_dict(kmer_t key,
 
 static int ref_dict_entry_cmp(const void *key, const void *entry)
 {
+#if REF_LITE
+	const uint64_t kmer_lo = *(uint64_t *)key;
+	const uint64_t entry_lo = ((struct kmer_entry *)entry)->kmer_lo40;
+#else
 	const uint32_t kmer_lo = *(uint32_t *)key;
 	const uint32_t entry_lo = ((struct kmer_entry *)entry)->kmer_lo;
+#endif
 	return (kmer_lo > entry_lo) - (kmer_lo < entry_lo);
 }
 
@@ -117,8 +129,13 @@ static struct kmer_entry *query_ref_dict(kmer_t key,
                                          struct kmer_entry *ref_dict,
                                          const size_t ref_dict_size)
 {
+#if REF_LITE
+	const uint32_t kmer_hi = HI24(key);
+	const uint64_t kmer_lo = LO40(key);
+#else
 	const uint32_t kmer_hi = HI(key);
 	const uint32_t kmer_lo = LO(key);
+#endif
 
 	const uint32_t lo = ref_jumpgate[kmer_hi];
 
@@ -126,7 +143,11 @@ static struct kmer_entry *query_ref_dict(kmer_t key,
 		return NULL;
 	}
 
+#if REF_LITE
+	const uint32_t hi = (kmer_hi == 0xFFFFFF ? ref_dict_size : ref_jumpgate[kmer_hi + 1]);
+#else
 	const uint32_t hi = (kmer_hi == 0xFFFFFFFF ? ref_dict_size : ref_jumpgate[kmer_hi + 1]);
+#endif
 
 	if (lo == hi) {
 		return NULL;
@@ -214,7 +235,12 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 	uint32_t *snp_jumpgate;
 	struct snp_kmer_entry *snp_dict;
 	struct snp_aux_table *snp_aux_table;
+
+#if PCOMPACT
+	PileupTable ptable;
+#else
 	struct pileup_entry *pileup_table;
+#endif
 
 	uint32_t last_hi;
 	uint32_t max_pos = 0;
@@ -230,7 +256,11 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		exit(EXIT_FAILURE);
 	}
 
+#if REF_LITE
+	ref_jumpgate = malloc(POW_2_24 * sizeof(*ref_jumpgate));
+#else
 	ref_jumpgate = malloc(POW_2_32 * sizeof(*ref_jumpgate));
+#endif
 	assert(ref_jumpgate);
 	ref_dict = malloc(ref_dict_size * sizeof(*ref_dict));
 	assert(ref_dict);
@@ -244,14 +274,22 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		const uint32_t pos = read_uint32(refdict_file);
 		const uint8_t ambig_flag = read_uint8(refdict_file);
 
+#if REF_LITE
+		ref_dict[i].kmer_lo40 = LO40(kmer);
+#else
 		ref_dict[i].kmer_lo = LO(kmer);
+#endif
 		ref_dict[i].pos = pos;
 		ref_dict[i].ambig_flag = ambig_flag;
 
 		if (pos > max_pos)
 			max_pos = pos;
 
+#if REF_LITE
+		const uint32_t hi = HI24(kmer);
+#else
 		const uint32_t hi = HI(kmer);
+#endif
 
 		if (hi != last_hi) {
 #if DEBUG
@@ -264,10 +302,17 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		}
 	}
 
+#if REF_LITE
+	if (last_hi != 0xFFFFFF) {
+		for (size_t j = (last_hi + 1); j < POW_2_24; j++)
+			ref_jumpgate[j] = ref_dict_size;
+	}
+#else
 	if (last_hi != 0xFFFFFFFF) {
 		for (size_t j = (last_hi + 1); j < POW_2_32; j++)
 			ref_jumpgate[j] = ref_dict_size;
 	}
+#endif
 
 	for (size_t i = 0; i < ref_aux_table_size; i++) {
 		for (size_t j = 0; j < AUX_TABLE_COLS; j++) {
@@ -276,6 +321,9 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 	}
 
 	/* === Pileup Table Initialization === */
+#if PCOMPACT
+	ptable_init(&ptable, PILEUP_TABLE_INIT_SIZE);
+#else
 	/*
 	 * We assume that the maximum position encountered in the
 	 * reference dictionary will not be smaller than the
@@ -284,7 +332,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 	 */
 	size_t pileup_size = (size_t)max_pos + 32 + 1;
 	pileup_table = calloc(pileup_size, sizeof(*pileup_table));
-
+#endif
 
 	/* === SNP Dictionary Construction === */
 	const size_t snp_dict_size = read_uint64(snpdict_file);
@@ -324,8 +372,11 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		     ambig_flag == FLAG_UNAMBIGUOUS) {
 
 			const unsigned snp_info_pos = SNP_INFO_POS(snp);  // relative to k-mer
-			const size_t snp_pos = pos + snp_info_pos;        // relative to reference
+			const uint32_t snp_pos = pos + snp_info_pos;      // relative to reference
 
+#if PCOMPACT
+			ptable_add(&ptable, snp_pos, snp_info_ref, kmer_get_base(kmer, snp_info_pos), ref_freq, alt_freq);
+#else
 			if (snp_pos >= pileup_size) {
 				pileup_size = (snp_pos + 1) * sizeof(*pileup_table);
 				printf("Re-allocing pileup table to %lu entries...\n", pileup_size);
@@ -336,6 +387,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 			pileup_table[snp_pos].alt = kmer_get_base(kmer, snp_info_pos);
 			pileup_table[snp_pos].ref_freq = ref_freq;
 			pileup_table[snp_pos].alt_freq = alt_freq;
+#endif
 		}
 
 		const uint32_t hi = HI24(kmer);
@@ -416,6 +468,9 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		kmer_t kmer;
 		uint32_t position;  // 1-based position of read based on kmer hit
 		uint32_t kmer_pos;  // 1-based position of k-mer
+#if DEBUG
+		bool is_neighbor;
+#endif
 	} kmer_context;
 
 	kmer_context ref_hit_contexts[MAX_HITS];  // same count as `ref_hits` (i.e. `n_ref_hits`)
@@ -444,6 +499,11 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 #endif
 
 	fprintf(stderr, "Processing...\n");
+
+#if DEBUG
+	FILE *read_data = fopen("read_data.txt", "w");
+	assert(read_data);
+#endif
 
 	while (fgets(id, sizeof(id), fastq_file)) {
 		char *unused = fgets(read, sizeof(read), fastq_file);
@@ -525,7 +585,13 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 			if (orig_ref_hit_not_null && ref_hit->pos != POS_AMBIGUOUS) {
 				if (ref_hit->ambig_flag == FLAG_UNAMBIGUOUS) {
 					const uint32_t read_pos = ref_hit->pos - offset;
-					ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = kmer, .position = read_pos, .kmer_pos = ref_hit->pos};
+					ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = kmer,
+					                                                .position = read_pos,
+					                                                .kmer_pos = ref_hit->pos,
+#if DEBUG
+					                                                .is_neighbor = false
+#endif
+					                                            };
 					index_table_add(&index_table, read_pos);
 #if DEBUG
 					++unambig_hits;
@@ -540,7 +606,13 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 						if (pos == 0) break;
 
 						const uint32_t read_pos = pos - offset;
-						ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = kmer, .position = read_pos, .kmer_pos = pos};
+						ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = kmer,
+						                                                .position = read_pos,
+						                                                .kmer_pos = pos,
+#if DEBUG
+						                                                .is_neighbor = false
+#endif
+						                                            };
 						index_table_add(&index_table, read_pos);
 					}
 				} else {
@@ -556,7 +628,13 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 			if (orig_snp_hit_not_null && snp_hit->pos != POS_AMBIGUOUS) {
 				if (snp_hit->ambig_flag == FLAG_UNAMBIGUOUS) {
 					const uint32_t read_pos = snp_hit->pos - offset;
-					snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = kmer, .position = read_pos, .kmer_pos = snp_hit->pos};
+					snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = kmer,
+					                                                .position = read_pos,
+					                                                .kmer_pos = snp_hit->pos,
+#if DEBUG
+					                                                .is_neighbor = false
+#endif
+					                                            };
 					index_table_add(&index_table, read_pos);
 #if DEBUG
 					++unambig_hits;
@@ -571,7 +649,13 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 						if (pos == 0) break;
 
 						const uint32_t read_pos = pos - offset;
-						snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = kmer, .position = read_pos, .kmer_pos = pos};
+						snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = kmer,
+						                                                .position = read_pos,
+						                                                .kmer_pos = pos,
+#if DEBUG
+						                                                .is_neighbor = false
+#endif
+						                                            };
 						index_table_add(&index_table, read_pos);
 					}
 				} else {
@@ -606,13 +690,22 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 
 					if (ref_hit != NULL && ref_hit->pos != POS_AMBIGUOUS) {
 						if (ref_hit->ambig_flag == FLAG_UNAMBIGUOUS &&
+#if PCOMPACT
+							ptable_get(&ptable, ref_hit_diff_loc) == NULL
+#else
 					        pileup_table[ref_hit_diff_loc].ref == 0 &&
-					        pileup_table[ref_hit_diff_loc].alt == 0) {
+					        pileup_table[ref_hit_diff_loc].alt == 0
+#endif
+					       ) {
 
 							const uint32_t read_pos = ref_hit->pos - offset;
 							ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = neighbor,
 							                                                .position = read_pos,
-							                                                .kmer_pos = ref_hit->pos};
+							                                                .kmer_pos = ref_hit->pos,
+#if DEBUG
+							                                                .is_neighbor = true
+#endif
+							                                            };
 							index_table_add(&index_table, read_pos);
 #if DEBUG
 							++unambig_hits;
@@ -627,13 +720,22 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 								if (pos == 0) break;
 
 								const size_t ref_hit_diff_loc = pos + diff_base_pos;
-								if (pileup_table[ref_hit_diff_loc].ref == 0 &&
-					                pileup_table[ref_hit_diff_loc].alt == 0) {
-
+								if (
+#if PCOMPACT
+								     ptable_get(&ptable, ref_hit_diff_loc) == NULL
+#else
+								     pileup_table[ref_hit_diff_loc].ref == 0 &&
+					                 pileup_table[ref_hit_diff_loc].alt == 0
+#endif
+								   ) {
 									const uint32_t read_pos = pos - offset;
 									ref_hit_contexts[n_ref_hits++] = (kmer_context){.kmer = neighbor,
 									                                                .position = read_pos,
-									                                                .kmer_pos = pos};
+									                                                .kmer_pos = pos,
+#if DEBUG
+									                                                .is_neighbor = true
+#endif
+									                                            };
 									index_table_add(&index_table, read_pos);
 								}
 							}
@@ -651,7 +753,11 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 							const uint32_t read_pos = snp_hit->pos - offset;
 							snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = neighbor,
 							                                                .position = read_pos,
-							                                                .kmer_pos = snp_hit->pos};
+							                                                .kmer_pos = snp_hit->pos,
+#if DEBUG
+							                                                .is_neighbor = true
+#endif
+							                                            };
 							index_table_add(&index_table, read_pos);
 #if DEBUG
 							++unambig_hits;
@@ -670,7 +776,11 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 									const uint32_t read_pos = pos - offset;
 									snp_hit_contexts[n_snp_hits++] = (kmer_context){.kmer = neighbor,
 									                                                .position = read_pos,
-									                                                .kmer_pos = pos};
+									                                                .kmer_pos = pos,
+#if DEBUG
+									                                                .is_neighbor = true
+#endif
+									                                            };
 
 									index_table_add(&index_table, read_pos);
 								}
@@ -708,9 +818,21 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 				const kmer_t kmer = ref_hit_contexts[i].kmer;
 				for (unsigned i = 0; i < 32; i++) {
 					const unsigned base = kmer_get_base(kmer, i);
-					struct pileup_entry *p = &pileup_table[kmer_pos + i];
 
-					if (p->ref != p->alt) {  // i.e. there's a SNP here
+#if PCOMPACT
+					struct pileup_entry *p = ptable_get(&ptable, kmer_pos + i);
+#else
+					struct pileup_entry *p = &pileup_table[kmer_pos + i];
+#endif
+
+					if (
+#if PCOMPACT
+					    p != NULL
+#else
+					    p->ref != p->alt
+#endif
+					   ) {
+
 						if (base == p->ref) {
 #if DEBUG
 							read_good = true;
@@ -737,7 +859,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 						}
 #endif
 					}
-#if DEBUG
+#if DEBUG && !PCOMPACT
 					else {
 						assert(p->ref == 0 && p->alt == 0);
 					}
@@ -755,9 +877,21 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 				const kmer_t kmer = snp_hit_contexts[i].kmer;
 				for (unsigned i = 0; i < 32; i++) {
 					const unsigned base = kmer_get_base(kmer, i);
-					struct pileup_entry *p = &pileup_table[kmer_pos + i];
 
-					if (p->ref != p->alt) {  // i.e. there's a SNP here
+#if PCOMPACT
+					struct pileup_entry *p = ptable_get(&ptable, kmer_pos + i);
+#else
+					struct pileup_entry *p = &pileup_table[kmer_pos + i];
+#endif
+
+					if (
+#if PCOMPACT
+					    p != NULL
+#else
+					    p->ref != p->alt
+#endif
+					   ) {
+
 						if (base == p->ref) {
 #if DEBUG
 							read_good = true;
@@ -784,7 +918,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 						}
 #endif
 					}
-#if DEBUG
+#if DEBUG && !PCOMPACT
 					else {
 						assert(p->ref == 0 && p->alt == 0);
 					}
@@ -807,6 +941,29 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 			++bad_reads;
 
 		++total_count;
+
+		if (index_table.best) {
+			fprintf(read_data, "%s %d ", index_table.ambiguous ? "A" : "U", index_table.best->freq);
+
+			for (size_t i = 0; i < n_ref_hits; i++) {
+				const uint32_t index = ref_hit_contexts[i].position;
+
+				if (index == target_index) {
+					fprintf(read_data, "%u:%s ", index, ref_hit_contexts[i].is_neighbor ? "1" : "0");
+				}
+			}
+
+			for (size_t i = 0; i < n_snp_hits; i++) {
+				const uint32_t index = snp_hit_contexts[i].position;
+
+				if (index == target_index) {
+					fprintf(read_data, "%u:%s ", index, snp_hit_contexts[i].is_neighbor ? "1" : "0");
+				}
+			}
+
+			fprintf(read_data, "\n");
+		}
+
 		if (index_table.best != NULL && index_table.best->freq > 1 && !index_table.ambiguous) {
 			++match_count;
 		} else {
@@ -824,41 +981,63 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		index_table.ambiguous = false;
 	}
 
+#if DEBUG
+	fclose(read_data);
+#endif
+
 	size_t ref_call_count = 0;
 	size_t alt_call_count = 0;
 	size_t het_call_count = 0;
 
+#if PCOMPACT
+	struct pileup_entry **table = ptable.table;
+	const size_t pileup_size = ptable.size;
+#endif
+
 	for (size_t i = 0; i < pileup_size; i++) {
+#if PCOMPACT
+		for (struct pileup_entry *p = table[i]; p != NULL; p = p->next) {
+#else
 		struct pileup_entry *p = &pileup_table[i];
-		if (p->ref == p->alt) {
-			continue;  // no SNP here
+#endif
+
+			if (p->ref == p->alt) {
+				continue;  // no SNP here
+			}
+
+#if PCOMPACT
+			size_t index = p->key;
+#else
+			size_t index = i;
+#endif
+
+			/* index w.r.t. correct chromosome */
+			size_t j;
+			for (j = 0; j < num_chrs && index > chrlens[j].len; j++) {
+				index -= chrlens[j].len;
+			}
+
+			const struct call call = choose_best_genotype(p->ref_cnt, p->alt_cnt, p->ref_freq, p->alt_freq);
+
+			switch (call.genotype) {
+			case GTYPE_NONE:
+				break;
+			case GTYPE_REF:
+				++ref_call_count;
+				break;
+			case GTYPE_ALT:
+				++alt_call_count;
+				fprintf(out, "%s %lu %.15g\n", chrlens[j].name, index, call.confidence);
+				break;
+			case GTYPE_HET:
+				++het_call_count;
+				fprintf(out, "%s %lu %.15g\n", chrlens[j].name, index, call.confidence);
+				break;
+			}
+
+#if PCOMPACT
 		}
-
-		size_t index = i;
-
-		/* index w.r.t. correct chromosome */
-		size_t j;
-		for (j = 0; j < num_chrs && index > chrlens[j].len; j++) {
-			index -= chrlens[j].len;
-		}
-
-		const struct call call = choose_best_genotype(p->ref_cnt, p->alt_cnt, p->ref_freq, p->alt_freq);
-
-		switch (call.genotype) {
-		case GTYPE_NONE:
-			break;
-		case GTYPE_REF:
-			++ref_call_count;
-			break;
-		case GTYPE_ALT:
-			++alt_call_count;
-			fprintf(out, "%s %lu %.12g\n", chrlens[j].name, index, call.confidence);
-			break;
-		case GTYPE_HET:
-			++het_call_count;
-			fprintf(out, "%s %lu %.12g\n", chrlens[j].name, index, call.confidence);
-			break;
-		}
+#endif
 	}
 
 	end = clock();
@@ -866,6 +1045,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 	printf("Time: %f sec\n", time_spent);
 
 #if DEBUG
+	/*
 	static const char bases[] = {'A', 'C', 'G', 'T'};
 	FILE *counts = fopen("counts.txt", "w");
 	FILE *all_snps = fopen("all_snps.txt", "w");
@@ -878,7 +1058,7 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 
 		size_t index = i;
 
-		/* index w.r.t. correct chromosome */
+		// index w.r.t. correct chromosome
 		size_t j;
 		for (j = 0; j < num_chrs && index > chrlens[j].len; j++) {
 			index -= chrlens[j].len;
@@ -897,8 +1077,10 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 		}
 		fprintf(all_snps, "%s %lu\n", chrlens[j].name, index);
 	}
+
 	fclose(all_snps);
 	fclose(counts);
+	*/
 
 	printf("Total: %lu\n", total_count);
 	printf("Match: %lu\n", match_count);
@@ -926,7 +1108,12 @@ static void genotype(FILE *refdict_file, FILE *snpdict_file, FILE *fastq_file, F
 	free(snp_jumpgate);
 	free(snp_dict);
 	free(snp_aux_table);
+
+#if PCOMPACT
+	ptable_dealloc(&ptable);
+#else
 	free(pileup_table);
+#endif
 }
 
 static inline struct call choose_best_genotype(const int ref_cnt,
@@ -935,9 +1122,9 @@ static inline struct call choose_best_genotype(const int ref_cnt,
                                                const uint8_t alt_freq_enc)
 {
 	static struct {
-		float g0;  // P(counts|G0)/(ref_cnt + alt_cnt choose ref_cnt)
-		float g1;  // P(counts|G1)/(ref_cnt + alt_cnt choose ref_cnt)
-		float g2;  // P(counts|G2)/(ref_cnt + alt_cnt choose ref_cnt)
+		double g0;  // P(counts|G0)/(ref_cnt + alt_cnt choose ref_cnt)
+		double g1;  // P(counts|G1)/(ref_cnt + alt_cnt choose ref_cnt)
+		double g2;  // P(counts|G2)/(ref_cnt + alt_cnt choose ref_cnt)
 	} cache[MAX_COV + 1][MAX_COV + 1];
 
 	static double poisson[2*MAX_COV + 1];
@@ -947,9 +1134,9 @@ static inline struct call choose_best_genotype(const int ref_cnt,
 	if (!init) {
 		for (int ref_cnt = 0; ref_cnt <= MAX_COV; ref_cnt++) {
 			for (int alt_cnt = 0; alt_cnt <= MAX_COV; alt_cnt++) {
-				cache[ref_cnt][alt_cnt].g0 = pow(1 - ERR_RATE, ref_cnt) * pow(ERR_RATE, alt_cnt);
+				cache[ref_cnt][alt_cnt].g0 = pow(1.0 - ERR_RATE, ref_cnt) * pow(ERR_RATE, alt_cnt);
 				cache[ref_cnt][alt_cnt].g1 = pow(0.5, ref_cnt + alt_cnt);
-				cache[ref_cnt][alt_cnt].g2 = pow(ERR_RATE, ref_cnt) * pow(1 - ERR_RATE, alt_cnt);
+				cache[ref_cnt][alt_cnt].g2 = pow(ERR_RATE, ref_cnt) * pow(1.0 - ERR_RATE, alt_cnt);
 			}
 		}
 
@@ -965,19 +1152,19 @@ static inline struct call choose_best_genotype(const int ref_cnt,
 		return CALL(GTYPE_NONE, 0.0);
 	}
 
-	const float g0 = cache[ref_cnt][alt_cnt].g0;
-	const float g1 = cache[ref_cnt][alt_cnt].g1;
-	const float g2 = cache[ref_cnt][alt_cnt].g2;
+	const double g0 = cache[ref_cnt][alt_cnt].g0;
+	const double g1 = cache[ref_cnt][alt_cnt].g1;
+	const double g2 = cache[ref_cnt][alt_cnt].g2;
 
-	const float p = ref_freq_enc/255.0f;
-	const float q = alt_freq_enc/255.0f;
-	const float p2 = p*p;
-	const float q2 = q*q;
+	const double p = ref_freq_enc/255.0;
+	const double q = alt_freq_enc/255.0;
+	const double p2 = p*p;
+	const double q2 = q*q;
 
-	const float p_g0 = p2*g0;
-	const float p_g1 = (1.0f - p2 - q2)*g1;
-	const float p_g2 = q2*g2;
-	const float total = p_g0 + p_g1 + p_g2;
+	const double p_g0 = p2*g0;
+	const double p_g1 = (1.0 - p2 - q2)*g1;
+	const double p_g2 = q2*g2;
+	const double total = p_g0 + p_g1 + p_g2;
 
 	const int n = ref_cnt + alt_cnt;
 
@@ -999,9 +1186,11 @@ static void print_help(void)
 	fprintf(stderr, "Option  Description                   Parameters\n");
 	fprintf(stderr, "------  -----------                   ----------\n");
 	fprintf(stderr, "dict    Generate dictionary files     "
-		"<input FASTA> <input SNPs> <output ref dict> <output SNP dict>\n");
+	                "<input FASTA> <input SNPs> <output ref dict> <output SNP dict>\n");
+	fprintf(stderr, "filt    Filter reference dictionary   "
+		            "<ref dict> <snp_pos file> <output ref dict>\n");
 	fprintf(stderr, "lava    Perform genotyping            "
-		"<input ref dict> <input SNP dict> <input FASTQ> <chrlens file> <output file>\n");
+	                "<input ref dict> <input SNP dict> <input FASTQ> <chrlens file> <output file>\n");
 }
 
 static void arg_check(int argc, int expected)
@@ -1044,24 +1233,55 @@ int main(const int argc, const char *argv[])
 
 		fclose(chrlens);
 
-		FILE *refdict_file = fopen(refdict_filename, "wb");
-		assert(refdict_file);
-
-		make_ref_dict(ref, refdict_file);
-
-		fclose(refdict_file);
-
 		FILE *snp_file = fopen(snp_filename, "r");
 		assert(snp_file);
 
 		FILE *snpdict_file = fopen(snpdict_filename, "wb");
 		assert(snpdict_file);
 
-		make_snp_dict(ref, snp_file, snpdict_file);
+		bool *snp_locations;
+		size_t snp_locs_size;
+		make_snp_dict(ref, snp_file, snpdict_file, &snp_locations, &snp_locs_size);
+		assert(snp_locations);
+
+#if GEN_FLT_DATA
+		FILE *snp_locs = fopen("snp_locs", "wb");
+		assert(snp_locs);
+		serialize_uint64(snp_locs, snp_locs_size);
+		for (size_t i = 0; i < snp_locs_size; i++) {
+			serialize_uint8(snp_locs, snp_locations[i]);
+		}
+		fclose(snp_locs);
+#endif
+
+		FILE *refdict_file = fopen(refdict_filename, "wb");
+		assert(refdict_file);
+
+		make_ref_dict(ref, refdict_file);
+
+		fclose(refdict_file);
+		free(snp_locations);
 
 		seqvec_dealloc(&ref);
 		fclose(snp_file);
 		fclose(snpdict_file);
+	} else if (STREQ(opt, "filt")) {
+		arg_check(argc, 3);
+
+		const char *refdict_filename = argv[2];
+		const char *snp_pos_filename = argv[3];
+		const char *out_filename = argv[4];
+
+		FILE *refdict_file = fopen(refdict_filename, "rb");
+		assert(refdict_file);
+
+		FILE *snp_pos_file = fopen(snp_pos_filename, "rb");
+		assert(snp_pos_file);
+
+		FILE *out_file = fopen(out_filename, "wb");
+		assert(out_file);
+
+		dict_filt(refdict_file, snp_pos_file, out_file);
 	} else if (STREQ(opt, "lava")) {
 		arg_check(argc, 5);
 		const char *refdict_filename = argv[2];

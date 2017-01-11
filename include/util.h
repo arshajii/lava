@@ -20,6 +20,7 @@
 
 #define HI(kmer)   (((kmer) & 0xFFFFFFFF00000000) >> 32)
 #define LO(kmer)   ((kmer) & 0x00000000FFFFFFFF)
+
 #define HI24(kmer) (((kmer) & 0xFFFFFF0000000000) >> 40)
 #define LO40(kmer) ((kmer) & 0x000000FFFFFFFFFF)
 

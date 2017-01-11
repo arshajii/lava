@@ -319,6 +319,25 @@ static Seq *find_seq_by_name(SeqVec ref, const char *name, unsigned int *start_i
 	return NULL;
 }
 
+static char rev(const char c) {
+	switch (c) {
+	case 'A':
+	case 'a':
+		return 'T';
+	case 'C':
+	case 'c':
+		return 'G';
+	case 'G':
+	case 'g':
+		return 'C';
+	case 'T':
+	case 't':
+		return 'A';
+	default:
+		return 'N';
+	}
+}
+
 /*
  * `snp_file` in this case is a file in the UCSC SNP-txt format, consisting
  * of common SNP to be included in the dictionary.
@@ -328,7 +347,7 @@ static Seq *find_seq_by_name(SeqVec ref, const char *name, unsigned int *start_i
  *
  * Be sure to filter any SNPs with abnormal conditions (e.g. inconsistent alleles).
  */
-void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out)
+void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out, bool **snp_locations, size_t *snp_locs_size)
 {
 #define CHROM_FIELD   1
 #define INDEX_FIELD   2
@@ -352,6 +371,11 @@ void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out)
 			++lines;
 	}
 	rewind(snp_file);
+
+	*snp_locs_size = 10;
+	*snp_locations = malloc(*snp_locs_size * sizeof(bool));
+	assert(*snp_locations);
+	memset(*snp_locations, false, *snp_locs_size);
 
 	const size_t max_kmers_len = lines * 32;  /* 32 k-mers per line */
 	struct snp_kmer_info *kmers = malloc(max_kmers_len * sizeof(*kmers));
@@ -421,8 +445,12 @@ void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out)
 			continue;
 		}
 
-		const char a1 = toupper(line_split[ALLELES_FIELD][0]);
-		const char a2 = toupper(line_split[ALLELES_FIELD][2]);
+		const bool neg = (line_split[STRAND_FIELD][0] == '-');
+		if (!neg)
+			assert(line_split[STRAND_FIELD][0] == '+');
+
+		const char a1 = neg ? rev(toupper(line_split[ALLELES_FIELD][0])) : toupper(line_split[ALLELES_FIELD][0]);
+		const char a2 = neg ? rev(toupper(line_split[ALLELES_FIELD][2])) : toupper(line_split[ALLELES_FIELD][2]);
 
 		assert((a1 == 'A' || a1 == 'C' || a1 == 'G' || a1 == 'T') &&
 		       (a2 == 'A' || a2 == 'C' || a2 == 'G' || a2 == 'T'));
@@ -430,6 +458,15 @@ void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out)
 		if (a1 != ref_base && a2 != ref_base) {
 			continue;
 		}
+
+		const size_t loc = start_index + index;
+		if (loc >= *snp_locs_size) {
+			*snp_locations = realloc(*snp_locations, (loc + 1) * sizeof(bool));
+			assert(*snp_locations);
+			memset(*snp_locations + *snp_locs_size, false, loc - *snp_locs_size + 1);
+			*snp_locs_size = loc + 1;
+		}
+		(*snp_locations)[loc] = true;
 
 		char *p = line_split[FREQS_FIELD];
 		float freq1 = atof(p);
@@ -448,7 +485,7 @@ void make_snp_dict(SeqVec ref, FILE *snp_file, FILE *out)
 		for (char *alt_p = line_split[ALT_FIELD]; !isspace(*alt_p); alt_p++) {
 			struct snp_kmer_info snp_kmers[32];
 
-			const char alt = toupper(*alt_p);
+			const char alt = neg ? rev(toupper(*alt_p)) : toupper(*alt_p);
 
 			if (alt == ref_base || !(alt == 'A' || alt == 'C' || alt == 'G' || alt == 'T')) {
 				continue;
